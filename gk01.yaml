@@ -1,0 +1,676 @@
+esphome:
+  name: gk01
+  includes:
+    - ir_store.h
+  platformio_options:
+    board_build.filesystem: spiffs
+    board_build.ldscript: eagle.flash.4m1m.ld
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          ir_store::init();
+          id(ts_boot_info).publish_state(String(ESP.getResetReason()).c_str());
+          id(g_mqtt_connected) = false;
+          id(ti_mqtt_broker).publish_state(id(g_mqtt_broker));
+          id(ti_mqtt_user).publish_state(id(g_mqtt_user));
+          id(ti_mqtt_pass).publish_state(id(g_mqtt_pass));
+          id(ti_mqtt_port).publish_state(std::to_string(id(g_mqtt_port)));
+          id(ts_slot_count).publish_state(std::to_string(ir_store::slots_count()) + " 个");
+          id(ts_ir_counter).publish_state(std::to_string(id(g_ir_counter)) + " 次");
+          ESP_LOGI("gk01", "Boot done, %d slots active", ir_store::slots_count());
+          ESP_LOGI("gk01", "MQTT config: %s:%d user=%s", id(g_mqtt_broker).c_str(), id(g_mqtt_port), id(g_mqtt_user).c_str());
+
+esp8266:
+  board: esp12e
+  framework:
+    version: recommended
+  restore_from_flash: true
+
+preferences:
+  flash_write_interval: 10s
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "GK01-Fallback"
+
+captive_portal:
+
+logger:
+  level: DEBUG
+
+api:
+
+mqtt:
+  broker: !secret mqtt_broker
+  port: 1883
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: false
+  birth_message:
+    topic: gk01/status
+    payload: online
+  will_message:
+    topic: gk01/status
+    payload: offline
+  on_connect:
+    then:
+      - lambda: |-
+          id(g_mqtt_connected) = true;
+          ESP_LOGI("gk01", "MQTT CONNECTED to %s:%d", id(g_mqtt_broker).c_str(), id(g_mqtt_port));
+          for (auto* s : ir_store::get_active_slots()) {
+            std::string topic = "homeassistant/button/gk01_ir_" + std::to_string(s->id) + "/config";
+            std::string payload = "{\"name\":\"" + s->name + "\",\"command_topic\":\"gk01/ir/cmd\",\"payload_press\":\"emit:" + std::to_string(s->id) + "\",\"unique_id\":\"gk01_ir_" + std::to_string(s->id) + "\",\"device\":{\"identifiers\":[\"gk01\"],\"name\":\"GK01 IR Remote\",\"model\":\"ESP12F\",\"manufacturer\":\"ESPHome\"}}";
+            if (mqtt::global_mqtt_client != nullptr) {
+              mqtt::global_mqtt_client->publish(topic, payload, 0, true);
+            }
+          }
+  on_disconnect:
+    then:
+      - lambda: |-
+          id(g_mqtt_connected) = false;
+          ESP_LOGI("gk01", "MQTT DISCONNECTED");
+  on_message:
+    - topic: gk01/ir/cmd
+      then:
+        - lambda: |-
+            std::string cmd = x;
+            ESP_LOGI("gk01", "MQTT cmd: %s", cmd.c_str());
+            if (cmd.rfind("emit:", 0) == 0) {
+              int sid = atoi(cmd.substr(5).c_str());
+              auto* s = ir_store::find_slot(sid);
+              if (!s || !s->active) {
+                ESP_LOGW("gk01", "Emit failed: slot %d not found", sid);
+                return;
+              }
+              id(g_tx_protocol) = s->protocol;
+              id(g_tx_code) = s->code;
+              id(g_tx_raw_json) = s->raw_json;
+              id(g_tx_carrier) = s->carrier_hz;
+              id(g_tx_valid) = true;
+              ESP_LOGI("gk01", "Emit: %s", s->name.c_str());
+              if (s->protocol == "NEC") {
+                size_t p = s->code.find(':');
+                if (p != std::string::npos) {
+                  id(g_nec_addr) = (uint16_t)strtol(s->code.substr(0,p).c_str(), nullptr, 10);
+                  id(g_nec_cmd) = (uint16_t)strtol(s->code.substr(p+1).c_str(), nullptr, 10);
+                }
+                id(do_transmit_nec).execute();
+              } else {
+                id(do_transmit_raw).execute();
+              }
+              id(blink_red).execute();
+            } else if (cmd.rfind("delete:", 0) == 0) {
+              int sid = atoi(cmd.substr(7).c_str());
+              bool ok = ir_store::delete_slot(sid);
+              if (mqtt::global_mqtt_client != nullptr) {
+                std::string topic = "homeassistant/button/gk01_ir_" + std::to_string(sid) + "/config";
+                mqtt::global_mqtt_client->publish(topic, std::string(""), 0, true);
+              }
+              ESP_LOGI("gk01", "Delete slot %d: %s", sid, ok ? "ok" : "fail");
+            } else if (cmd.rfind("rename:", 0) == 0) {
+              size_t p = cmd.find(':', 7);
+              if (p != std::string::npos) {
+                int sid = atoi(cmd.substr(7, p-7).c_str());
+                std::string name = cmd.substr(p+1);
+                bool ok = ir_store::rename_slot(sid, name);
+                if (ok && mqtt::global_mqtt_client != nullptr) {
+                  auto* s = ir_store::find_slot(sid);
+                  if (s) {
+                    std::string topic = "homeassistant/button/gk01_ir_" + std::to_string(sid) + "/config";
+                    std::string payload = "{\"name\":\"" + s->name + "\",\"command_topic\":\"gk01/ir/cmd\",\"payload_press\":\"emit:" + std::to_string(sid) + "\",\"unique_id\":\"gk01_ir_" + std::to_string(sid) + "\",\"device\":{\"identifiers\":[\"gk01\"],\"name\":\"GK01 IR Remote\",\"model\":\"ESP12F\",\"manufacturer\":\"ESPHome\"}}";
+                    mqtt::global_mqtt_client->publish(topic, payload, 0, true);
+                  }
+                }
+                ESP_LOGI("gk01", "Rename slot %d: %s", sid, ok ? "ok" : "fail");
+              }
+            }
+
+ota:
+  - platform: esphome
+  - platform: web_server
+
+web_server:
+  port: 80
+
+# ── 红外接收 GPIO5 ────────────────────────────────────────────
+remote_receiver:
+  id: remote_rx
+  pin:
+    number: GPIO5
+    inverted: true
+    mode:
+      input: true
+      pullup: true
+  dump:
+    - nec
+    - sony
+    - rc5
+    - rc_switch
+  tolerance: 50%
+  filter: 250us
+  idle: 25ms
+  buffer_size: 2kb
+
+  on_nec:
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          if (now - id(g_last_ir_ms) < 300) return;
+          id(g_last_ir_ms) = now;
+
+          char buf[40];
+          snprintf(buf, sizeof(buf), "NEC:%04X:%04X", x.address, x.command);
+          std::string code = buf;
+          id(g_last_code) = code;
+
+          if (mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+            mqtt::global_mqtt_client->publish("gk01/ir/receive", code, 0, false);
+          }
+
+          std::string val = ir_store::keymap_get(code);
+          std::string slot_name = ir_store::find_slot_by_ir_code(code);
+          id(g_last_value) = val;
+
+          id(ti_ir_code).publish_state(code);
+          if (!val.empty()) {
+            id(ti_value).publish_state(val);
+            id(ts_ir_status).publish_state(code + "——映射——" + val);
+          } else if (!slot_name.empty()) {
+            id(ti_value).publish_state(slot_name);
+            id(ts_ir_status).publish_state(code + "——发送——" + slot_name);
+          } else {
+            id(ti_value).publish_state("");
+            id(ts_ir_status).publish_state(code + "——未注册");
+          }
+          ESP_LOGI("gk01", "IR NEC %s -> mapped=%s slot=%s", code.c_str(), val.empty() ? "no" : val.c_str(), slot_name.empty() ? "no" : slot_name.c_str());
+          id(g_ir_counter)++;
+          id(ts_ir_counter).publish_state(std::to_string(id(g_ir_counter)) + " 次");
+          id(blink_yellow).execute();
+
+          if (!val.empty() && mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+            mqtt::global_mqtt_client->publish("gk01/ir/mapped", code + "->" + val, 0, false);
+          }
+
+  on_rc_switch:
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          if (now - id(g_last_ir_ms) < 300) return;
+          id(g_last_ir_ms) = now;
+
+          std::string code = ir_store::uint64_to_bin(x.code);
+          std::string full_code = "RCSWITCH:" + std::to_string(x.protocol) + ":" + code;
+          id(g_last_code) = full_code;
+
+          if (mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+            mqtt::global_mqtt_client->publish("gk01/ir/receive", full_code, 0, false);
+          }
+
+          std::string val = ir_store::keymap_get(code);
+          std::string slot_name = ir_store::find_slot_by_ir_code(full_code);
+          id(g_last_value) = val;
+
+          id(ti_ir_code).publish_state(full_code);
+          if (!val.empty()) {
+            id(ti_value).publish_state(val);
+            id(ts_ir_status).publish_state(full_code + "——映射——" + val);
+          } else if (!slot_name.empty()) {
+            id(ti_value).publish_state(slot_name);
+            id(ts_ir_status).publish_state(full_code + "——发送——" + slot_name);
+          } else {
+            id(ti_value).publish_state("");
+            id(ts_ir_status).publish_state(full_code + "——未注册");
+          }
+          ESP_LOGI("gk01", "IR RC %s -> mapped=%s slot=%s", full_code.c_str(), val.empty() ? "no" : val.c_str(), slot_name.empty() ? "no" : slot_name.c_str());
+          id(g_ir_counter)++;
+          id(ts_ir_counter).publish_state(std::to_string(id(g_ir_counter)) + " 次");
+          id(blink_yellow).execute();
+
+          if (!val.empty() && mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+            mqtt::global_mqtt_client->publish("gk01/ir/mapped", full_code + "->" + val, 0, false);
+          }
+
+  on_raw:
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          if (now - id(g_last_ir_ms) < 300) return;
+          id(g_last_ir_ms) = now;
+
+          const size_t MAX_PULSES = 600;
+          size_t n = x.size();
+          if (n > MAX_PULSES) n = MAX_PULSES;
+
+          std::string s = "[";
+          for (size_t i = 0; i < n; i++) {
+            s += std::to_string((int)x[i]);
+            if (i + 1 < n) s += ",";
+          }
+          s += "]";
+
+          std::string raw_id = "RAW_" + std::to_string(n) + "_" + std::to_string(now);
+          std::string code = "RAW:" + raw_id;
+          id(g_last_code) = code;
+          id(g_last_raw_json) = s;
+          id(g_last_carrier_hz) = 38000;
+          id(g_last_is_raw) = true;
+
+          id(ti_ir_code).publish_state(code);
+          id(ti_value).publish_state("");
+          id(ts_ir_status).publish_state(code + "——未注册");
+          ESP_LOGI("gk01", "Raw received: %zu pulses", n);
+          id(g_ir_counter)++;
+          id(ts_ir_counter).publish_state(std::to_string(id(g_ir_counter)) + " 次");
+          id(blink_yellow).execute();
+
+# ── 红外发射 GPIO14 ───────────────────────────────────────────━
+remote_transmitter:
+  id: remote_tx
+  pin: GPIO14
+  carrier_duty_percent: 50%
+
+# ── 脚本 ────────────────────────────────────────────
+script:
+  - id: do_transmit_nec
+    mode: single
+    then:
+      - remote_transmitter.transmit_nec:
+          address: !lambda 'return id(g_nec_addr);'
+          command: !lambda 'return id(g_nec_cmd);'
+
+  - id: do_transmit_raw
+    mode: single
+    then:
+      - remote_transmitter.transmit_raw:
+          transmitter_id: remote_tx
+          carrier_frequency: !lambda 'return (float)id(g_tx_carrier);'
+          code: !lambda 'return ir_store::parse_raw_json(id(g_tx_raw_json));'
+
+  - id: blink_yellow
+    mode: single
+    then:
+      - output.turn_on: out_yellow
+      - delay: 200ms
+      - output.turn_off: out_yellow
+
+  - id: blink_red
+    mode: single
+    then:
+      - output.turn_on: out_red
+      - delay: 200ms
+      - output.turn_off: out_red
+
+# ── 输出 GPIO（不显示，仅内部使用）─────────────────────────
+output:
+  - platform: gpio
+    pin: GPIO12
+    id: out_red
+    inverted: true
+  - platform: gpio
+    pin: GPIO13
+    id: out_yellow
+    inverted: true
+
+# ── 全局变量 ─────────────────────────────────────────────────────
+globals:
+  - id: g_last_code
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_last_value
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_last_ir_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_nec_addr
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_nec_cmd
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_last_raw_json
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_last_carrier_hz
+    type: int
+    restore_value: no
+    initial_value: '38000'
+  - id: g_last_is_raw
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_tx_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_tx_protocol
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_tx_code
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_tx_raw_json
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_tx_carrier
+    type: int
+    restore_value: no
+    initial_value: '38000'
+  - id: g_ir_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_mqtt_broker
+    type: std::string
+    restore_value: true
+    initial_value: '"192.168.3.5"'
+  - id: g_mqtt_user
+    type: std::string
+    restore_value: true
+    initial_value: '""'
+  - id: g_mqtt_pass
+    type: std::string
+    restore_value: true
+    initial_value: '""'
+  - id: g_mqtt_port
+    type: int
+    restore_value: true
+    initial_value: '1883'
+  - id: g_mqtt_connected
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# ═══════════════════════════════════════════════
+# 界面排序（按主人要求重新排）
+# ESP8266 web_server v1 按类型分组，sensor → text_sensor → text → button
+# 每个类型内部按定义顺序
+# ═══════════════════════════════════════════════
+
+# ── sensor: 1.运行时间  2.WiFi信号 ────────────────────────────────────────
+sensor:
+  - platform: uptime
+    name: "运行时间 uptime_sec"
+    type: seconds
+    update_interval: 60s
+
+  - platform: wifi_signal
+    name: "WiFi信号 dBm"
+    update_interval: 60s
+
+# ── text_sensor: 3.启动信息  8.槽位数量  9.发送槽位列表  10.接收映射列表  11.红外事件计数器  12.红外码状态 ──
+# 把槽位数量和计数器改为 text_sensor，这样就能排在启动信息后面
+# 显示格式保持一样，只是没有单位和小数位
+
+text_sensor:
+  - platform: template
+    name: "启动信息 boot_info"
+    id: ts_boot_info
+    icon: mdi:restart
+    update_interval: never
+
+  - platform: template
+    name: "MQTT连接状态 mqtt_status"
+    id: ts_mqtt_status
+    icon: mdi:connection
+    update_interval: 5s
+    lambda: 'return id(g_mqtt_connected) ? std::string("已连接") : std::string("未连接");'
+
+  - platform: template
+    name: "槽位数量 slot_count"
+    id: ts_slot_count
+    icon: mdi:numeric
+    update_interval: 30s
+    lambda: 'return std::to_string(ir_store::slots_count()) + " 个";;'
+
+  - platform: template
+    name: "发送槽位列表 slots"
+    id: ts_slots_list
+    icon: mdi:format-list-bulleted
+    update_interval: 30s
+    lambda: 'return ir_store::slots_to_json();'
+
+  - platform: template
+    name: "接收映射列表 keymap"
+    id: ts_keymap_list
+    icon: mdi:format-list-bulleted
+    update_interval: 30s
+    lambda: 'return ir_store::keymap_to_json();'
+
+  - platform: template
+    name: "红外事件计数器"
+    id: ts_ir_counter
+    icon: mdi:counter
+    update_interval: never
+    lambda: 'return std::to_string(id(g_ir_counter)) + " 次";;'
+
+  - platform: template
+    name: "红外码状态 ir_status"
+    id: ts_ir_status
+    icon: mdi:remote
+    update_interval: never
+
+# ── text: 4.MQTT地址  5.MQTT用户名  6.MQTT密码  7.MQTT端口  13.红外码值  14.映射值/发送值 ──
+# MQTT配置使用 globals 持久化，set_action 保存到 flash
+
+text:
+  - platform: template
+    name: "MQTT地址 broker"
+    id: ti_mqtt_broker
+    mode: text
+    lambda: 'return id(g_mqtt_broker);'
+    set_action:
+      - lambda: 'id(g_mqtt_broker) = x;'
+    icon: mdi:server-network
+
+  - platform: template
+    name: "MQTT用户名 user"
+    id: ti_mqtt_user
+    mode: text
+    lambda: 'return id(g_mqtt_user);'
+    set_action:
+      - lambda: 'id(g_mqtt_user) = x;'
+    icon: mdi:account
+
+  - platform: template
+    name: "MQTT密码 password"
+    id: ti_mqtt_pass
+    mode: password
+    lambda: 'return id(g_mqtt_pass);'
+    set_action:
+      - lambda: 'id(g_mqtt_pass) = x;'
+    icon: mdi:key
+
+  - platform: template
+    name: "MQTT端口 port"
+    id: ti_mqtt_port
+    mode: text
+    lambda: 'return std::to_string(id(g_mqtt_port));'
+    set_action:
+      - lambda: |
+          int p = atoi(x.c_str());
+          if (p > 0 && p < 65536) id(g_mqtt_port) = p;
+    icon: mdi:numeric
+
+  - platform: template
+    name: "红外码值 ircode"
+    id: ti_ir_code
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 64
+    initial_value: ""
+    icon: mdi:barcode
+
+  - platform: template
+    name: "映射值/发送值 value"
+    id: ti_value
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 128
+    initial_value: ""
+    icon: mdi:pencil
+
+# ── button: 15.接收映射写入  16.学习发送写入  17.删除发送按键  18.删除映射  19.重启设备 ──
+button:
+  - platform: template
+    name: "接收映射写入 save_mapped"
+    id: btn_save_mapped
+    icon: mdi:content-save
+    on_press:
+      then:
+        - lambda: |-
+            std::string code = id(g_last_code);
+            std::string val = ir_store::trim(id(ti_value).state);
+            if (code.empty() || val.empty()) {
+              ESP_LOGI("gk01", "错误：红外码或映射值为空");
+              return;
+            }
+            bool ok = ir_store::keymap_set(code, val);
+            ESP_LOGI("gk01", "%s", ok ? ("已保存映射: " + code + " -> " + val).c_str() : "保存失败");
+            id(ts_ir_status).publish_state(code + "——映射——" + val);
+            id(ts_slots_list).publish_state(ir_store::slots_to_json());
+            id(ts_keymap_list).publish_state(ir_store::keymap_to_json());
+
+  - platform: template
+    name: "学习发送写入 learn_send"
+    id: btn_learn_send
+    icon: mdi:book-open-variant
+    on_press:
+      then:
+        - lambda: |-
+            std::string code = id(g_last_code);
+            std::string name = ir_store::trim(id(ti_value).state);
+            if (code.empty() || name.empty()) {
+              ESP_LOGI("gk01", "错误：红外码或发送值为空");
+              return;
+            }
+            int sid = -1;
+            if (id(g_last_is_raw) && !id(g_last_raw_json).empty()) {
+              sid = ir_store::add_slot("RAW", code, name, id(g_last_raw_json), 38000);
+            } else if (code.rfind("NEC:", 0) == 0) {
+              size_t p1 = code.find(':', 4);
+              if (p1 != std::string::npos) {
+                std::string hex_addr = code.substr(4, p1-4);
+                std::string hex_cmd = code.substr(p1+1);
+                uint16_t addr = (uint16_t)strtol(hex_addr.c_str(), nullptr, 16);
+                uint16_t cmd = (uint16_t)strtol(hex_cmd.c_str(), nullptr, 16);
+                std::string slot_code = std::to_string(addr) + ":" + std::to_string(cmd);
+                sid = ir_store::add_slot("NEC", slot_code, name, "", 38000);
+              }
+            } else if (code.rfind("RCSWITCH:", 0) == 0) {
+              size_t p = code.find(':', 9);
+              if (p != std::string::npos) {
+                std::string rc_code = code.substr(p+1);
+                sid = ir_store::add_slot("RC_SWITCH", rc_code, name, "", 38000);
+              }
+            }
+            if (sid < 0) {
+              ESP_LOGI("gk01", "学习失败：无法解析红外码");
+              return;
+            }
+            if (mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+              std::string topic = "homeassistant/button/gk01_ir_" + std::to_string(sid) + "/config";
+              std::string payload = "{\"name\":\"" + name + "\",\"command_topic\":\"gk01/ir/cmd\",\"payload_press\":\"emit:" + std::to_string(sid) + "\",\"unique_id\":\"gk01_ir_" + std::to_string(sid) + "\",\"device\":{\"identifiers\":[\"gk01\"],\"name\":\"GK01 IR Remote\",\"model\":\"ESP12F\",\"manufacturer\":\"ESPHome\"}}";
+              mqtt::global_mqtt_client->publish(topic, payload, 0, true);
+            }
+            ESP_LOGI("gk01", "学习成功: %s -> %s (槽位%d)", code.c_str(), name.c_str(), sid);
+            id(ti_value).publish_state(name);
+            id(ts_ir_status).publish_state(code + "——发送——" + name);
+            id(ts_slots_list).publish_state(ir_store::slots_to_json());
+            id(ts_keymap_list).publish_state(ir_store::keymap_to_json());
+
+  - platform: template
+    name: "删除发送按键 delete_send"
+    id: btn_delete_send
+    icon: mdi:delete-forever
+    on_press:
+      then:
+        - lambda: |-
+            std::string code = ir_store::trim(id(ti_ir_code).state);
+            std::string name = ir_store::trim(id(ti_value).state);
+            int sid = -1;
+            std::string target_name;
+            if (!code.empty()) {
+              std::string slot_name = ir_store::find_slot_by_ir_code(code);
+              if (!slot_name.empty()) {
+                auto* s = ir_store::find_slot_by_name(slot_name);
+                if (s) {
+                  sid = s->id;
+                  target_name = slot_name;
+                }
+              }
+            }
+            if (sid < 0 && !name.empty()) {
+              auto* s = ir_store::find_slot_by_name(name);
+              if (s) {
+                sid = s->id;
+                target_name = name;
+              }
+            }
+            if (sid < 0) {
+              ESP_LOGI("gk01", "错误：未找到匹配的发送按键");
+              return;
+            }
+            if (mqtt::global_mqtt_client != nullptr) {
+              std::string topic = "homeassistant/button/gk01_ir_" + std::to_string(sid) + "/config";
+              mqtt::global_mqtt_client->publish(topic, std::string(""), 0, true);
+            }
+            bool ok = ir_store::delete_slot(sid);
+            ESP_LOGI("gk01", "%s", ok ? ("已删除发送按键: " + target_name + " (槽位" + std::to_string(sid) + ")").c_str() : ("删除失败: " + target_name).c_str());
+            if (ok) {
+              id(ts_ir_status).publish_state(code + "——未注册");
+              id(ti_value).publish_state("");
+              id(ts_slots_list).publish_state(ir_store::slots_to_json());
+              id(ts_keymap_list).publish_state(ir_store::keymap_to_json());
+            }
+
+  - platform: template
+    name: "删除映射 delete_mapped"
+    id: btn_delete_mapped
+    icon: mdi:delete
+    on_press:
+      then:
+        - lambda: |-
+            std::string code = ir_store::trim(id(ti_ir_code).state);
+            std::string val = ir_store::trim(id(ti_value).state);
+            bool ok = false;
+            std::string target;
+            if (!code.empty()) {
+              ok = ir_store::keymap_remove(code);
+              target = code;
+            }
+            if (!ok && !val.empty()) {
+              target = ir_store::keymap_find_by_value(val);
+              if (!target.empty()) {
+                ok = ir_store::keymap_remove(target);
+              }
+            }
+            if (target.empty()) {
+              ESP_LOGI("gk01", "错误：未找到匹配的映射");
+              return;
+            }
+            ESP_LOGI("gk01", "%s", ok ? ("已删除映射: " + target).c_str() : ("映射不存在: " + target).c_str());
+            if (ok) {
+              id(ts_ir_status).publish_state(code + "——未注册");
+              id(ti_value).publish_state("");
+              id(ts_slots_list).publish_state(ir_store::slots_to_json());
+              id(ts_keymap_list).publish_state(ir_store::keymap_to_json());
+            }
+
+  - platform: restart
+    name: "重启设备 reboot"
+    id: btn_reboot
