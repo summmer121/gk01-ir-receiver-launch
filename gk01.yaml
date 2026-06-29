@@ -67,6 +67,8 @@ mqtt:
               mqtt::global_mqtt_client->publish(topic, payload, 0, true);
             }
           }
+          // ── 接收映射 → MQTT Discovery 文本传感器（仅 MQTT，不影响 web 界面）──
+          id(publish_map_discovery).execute();
   on_disconnect:
     then:
       - lambda: |-
@@ -273,6 +275,11 @@ remote_transmitter:
   carrier_duty_percent: 50%
 
 # ── 脚本 ────────────────────────────────────────────
+interval:
+  - interval: 30s
+    then:
+      - script.execute: publish_map_discovery
+
 script:
   - id: do_transmit_nec
     mode: single
@@ -302,6 +309,25 @@ script:
       - output.turn_on: out_red
       - delay: 200ms
       - output.turn_off: out_red
+
+  - id: publish_map_discovery
+    mode: restart
+    then:
+      - lambda: |-
+          if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) return;
+          if (ir_store::keymap.empty()) { ir_store::keymap_load_fs(); }
+          ESP_LOGI("gk01", "[map_disc] publishing %u keymap entries", (unsigned)ir_store::keymap.size());
+          for (auto& kv : ir_store::keymap) {
+            std::string oid;
+            for (char c : kv.first) oid += ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')) ? c : '_';
+            std::string cfg_topic = "homeassistant/sensor/gk01_map_" + oid + "/config";
+            std::string st_topic = "gk01/map/" + oid + "/state";
+            std::string payload = "{\"name\":\"" + kv.second + "\",\"state_topic\":\"" + st_topic + "\",\"unique_id\":\"gk01_map_" + oid + "\",\"icon\":\"mdi:swap-horizontal\",\"device\":{\"identifiers\":[\"gk01\"],\"name\":\"GK01 IR Remote\",\"model\":\"ESP12F\",\"manufacturer\":\"ESPHome\"}}";
+            mqtt::global_mqtt_client->publish(cfg_topic, payload, 0, true);
+            mqtt::global_mqtt_client->publish(st_topic, kv.first, 0, true);
+            delay(60);
+          }
+          ESP_LOGI("gk01", "[map_disc] done");
 
 # ── 输出 GPIO（不显示，仅内部使用）─────────────────────────
 output:
@@ -541,6 +567,15 @@ button:
             }
             bool ok = ir_store::keymap_set(code, val);
             ESP_LOGI("gk01", "%s", ok ? ("已保存映射: " + code + " -> " + val).c_str() : "保存失败");
+            if (ok && mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+              std::string oid;
+              for (char c : code) oid += ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')) ? c : '_';
+              std::string cfg_topic = "homeassistant/sensor/gk01_map_" + oid + "/config";
+              std::string st_topic = "gk01/map/" + oid + "/state";
+              std::string payload = "{\"name\":\"" + val + "\",\"state_topic\":\"" + st_topic + "\",\"unique_id\":\"gk01_map_" + oid + "\",\"icon\":\"mdi:swap-horizontal\",\"device\":{\"identifiers\":[\"gk01\"],\"name\":\"GK01 IR Remote\",\"model\":\"ESP12F\",\"manufacturer\":\"ESPHome\"}}";
+              mqtt::global_mqtt_client->publish(cfg_topic, payload, 0, true);
+              mqtt::global_mqtt_client->publish(st_topic, code, 0, true);
+            }
             id(ts_ir_status).publish_state(code + "——映射——" + val);
             id(ts_slots_list).publish_state(ir_store::slots_to_json());
             id(ts_keymap_list).publish_state(ir_store::keymap_to_json());
@@ -665,6 +700,11 @@ button:
             }
             ESP_LOGI("gk01", "%s", ok ? ("已删除映射: " + target).c_str() : ("映射不存在: " + target).c_str());
             if (ok) {
+              if (mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+                std::string oid;
+                for (char c : target) oid += ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')) ? c : '_';
+                mqtt::global_mqtt_client->publish("homeassistant/sensor/gk01_map_" + oid + "/config", std::string(""), 0, true);
+              }
               id(ts_ir_status).publish_state(code + "——未注册");
               id(ti_value).publish_state("");
               id(ts_slots_list).publish_state(ir_store::slots_to_json());
