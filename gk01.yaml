@@ -565,6 +565,11 @@ button:
               ESP_LOGI("gk01", "错误：红外码或映射值为空");
               return;
             }
+            if (ir_store::name_taken(val, code)) {
+              ESP_LOGW("gk01", "名称重复：「%s」已被占用，禁止保存", val.c_str());
+              id(ts_ir_status).publish_state(std::string("名称重复：") + val + "——已存在，请改名");
+              return;
+            }
             bool ok = ir_store::keymap_set(code, val);
             ESP_LOGI("gk01", "%s", ok ? ("已保存映射: " + code + " -> " + val).c_str() : "保存失败");
             if (ok && mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
@@ -591,6 +596,11 @@ button:
             std::string name = ir_store::trim(id(ti_value).state);
             if (code.empty() || name.empty()) {
               ESP_LOGI("gk01", "错误：红外码或发送值为空");
+              return;
+            }
+            if (ir_store::name_taken(name)) {
+              ESP_LOGW("gk01", "名称重复：「%s」已被占用，禁止学习", name.c_str());
+              id(ts_ir_status).publish_state(std::string("名称重复：") + name + "——已存在，请改名");
               return;
             }
             int sid = -1;

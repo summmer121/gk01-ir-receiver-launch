@@ -368,6 +368,23 @@ namespace ir_store {
     return "";
   }
 
+  // 全局重名检查：名称是否已被「接收映射值」或「发送按键名」占用
+  // exclude_ir_code: 接收映射若编辑同一红外码（覆盖自身）则排除该条
+  bool name_taken(const std::string& raw_name, const std::string& exclude_ir_code = "") {
+    std::string n = trim(raw_name);
+    if (n.empty()) return false;
+    std::string ex = trim(exclude_ir_code);
+    // 接收映射值
+    for (auto& kv : keymap) {
+      if (kv.second == n && kv.first != ex) return true;
+    }
+    // 发送按键名
+    for (auto& s : slots) {
+      if (s.active && s.name == n) return true;
+    }
+    return false;
+  }
+
   void init() {
     begin_fs();
     keymap_load_fs();
